@@ -1,0 +1,719 @@
+---
+title: "Analyses"
+author: "Anders Skyrud Danielsen"
+date: "12 10 2023"
+output: html_document
+---
+
+# Setup
+
+```{r setup, echo=T}
+
+# Setup
+
+pacman::p_load(
+  survival,
+  tidyverse,
+  tidylog,
+  rio,
+  lubridate,
+  gtsummary,
+  viridis,
+  survminer,
+  lme4,
+  splines,
+  EValue,
+  patchwork,
+  broom
+  )
+
+# Load the data
+
+setwd("~/")
+
+study_data2 <- import("study_data2.csv") 
+
+study_data2 <- study_data2 %>% 
+  mutate(length_of_stay = replace_na(length_of_stay, 1)) %>% 
+  mutate(Charlson_grp = case_when(
+    Charlson <3 ~ "<3",
+    Charlson >2 & Charlson <6 ~ "3-5",
+    TRUE ~ ">5"))
+
+theme_set(theme_minimal())
+
+```
+
+# Analyses
+
+## Table 2
+
+```{r table1} 
+
+study_data2 %>% 
+  mutate(diagnosis_year = as.character(diagnosis_year)) %>% 
+  mutate(age_cat = factor(age_cat, levels = c("<40 years", "40-49 years", "50-59 years", "60-69 years", "70-79 years", "80-89 years", ">=90 years"))) %>% 
+  select(AMR, event, age_at_baseline, age_cat, LinkedSex, type_and_treatment, diagnosis_year, other_primary, polymicrobial, Charlson_grp, length_of_stay, total_positives) %>% 
+  tbl_summary(
+    by = AMR,
+    label = list(
+      event ~ "Non-survivor",
+      age_at_baseline ~ "Age (continuous)",
+      age_cat ~ "Age (categorical)",
+      LinkedSex ~ "Sex",
+      type_and_treatment ~ "Cancer type and treatment recieved",
+      diagnosis_year ~ "Year of cancer diagnosis",
+      other_primary ~ "Other primary infection",
+      polymicrobial ~ "Polymicrobial bacteraemia",
+      Charlson_grp ~ "Charlson Comorbidity Index",
+      length_of_stay ~ "Past hospitalisation",
+      total_positives ~ "Number of bacteraemias"
+    ),
+    percent = "row"
+  ) %>% 
+  add_overall() %>% 
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Resistant infection**") %>% 
+  bold_labels()
+
+```
+
+## Table 3
+
+What bug-drug combinations do we have?
+
+```{r bug-drug}
+
+study_data2 %>% 
+  select(event, TGCREC:CSEC) %>% 
+  tbl_summary(
+    by = event,
+    missing = "no",
+    label = list(
+    ),
+    percent = "row"
+  ) %>% 
+  add_overall() %>% 
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Non-survivors**") 
+
+```
+
+## Excess mortality and PAF estimation
+
+### Figure 2
+
+IPTW weighting, with a graphical display of weight distributions.
+
+```{r IPTW}
+
+# Weighting
+
+# Stabilised
+
+model_num <- glm(AMR ~ 1, 
+                 data = study_data2, family = binomial)
+model_denom <- glm(AMR ~ LinkedSex + age_at_baseline + factor(type_and_treatment) + polymicrobial + factor(Charlson_grp) +
+                     factor(diagnosis_year) + other_primary + length_of_stay,
+                 data = study_data2, family = binomial)
+
+prob.num <- predict(model_num, study_data2, type="response")
+prob.denum <- predict(model_denom, study_data2, type="response")
+
+study_data2$weight <- (study_data2$AMR==1)*prob.num/prob.denum + (study_data2$AMR==0)*(1-prob.num)/(1-prob.denum)
+
+print(summary(study_data2[study_data2$AMR == 0,]$weight))
+print(summary(study_data2[study_data2$AMR == 1,]$weight))
+
+
+# Unstabilised 
+#pAgivenL <- ifelse(study_data2$AMR == 0, 1-prob.denum, prob.denum)
+#study_data2$weight <- 1/pAgivenL
+#print(summary(study_data2$weight))
+
+# Create the mirror histogram plot
+mirror_hist_plot <- ggplot(subset(study_data2, AMR == 1), aes(x = weight, fill = factor(AMR))) +
+  geom_histogram(aes(y = - ..density..), bins = 30) +
+  geom_histogram(data = subset(study_data2, AMR == 0),
+                 aes(x = weight, y = ..density.., fill = factor(AMR)), bins = 30, alpha = 0.7) +
+  labs(y = "Density (%)", x = "IPWs", fill = "Exposure group") + 
+  scale_fill_viridis_d(labels = c("Resistant", "Susceptible")) + 
+  theme_classic() +
+  guides(fill = guide_legend(title = "Exposure Group"))
+
+# Save the plot
+ggsave("figure_2.png", plot = mirror_hist_plot, width = 8, height = 6, units = 'in', dpi = 300)
+
+```
+
+### Figure 3
+
+## Figure 3
+
+Crude survival curves.
+
+```{r survival curves}
+
+# crude survival curves 
+study_data2$event <- as.numeric(study_data2$event)
+
+# create a survival object using the Surv function
+surv_object <- survfit(Surv(studytime, event) ~ AMR, data = study_data2)
+
+# Export for plotting
+surv_data <- tidy(surv_object, conf.int = TRUE) 
+write.csv(surv_data, "figure_3A.csv", row.names = FALSE)
+
+```
+
+Weighted survival curves
+
+```{r weighted survival curves}
+
+set.seed(1337)
+
+# Function returning "curves" in step function format 
+
+stepf <- function(dataset) {
+  model_num <- glm(AMR ~ 1, data = dataset, family = binomial())
+  model_denom <- glm(AMR ~ LinkedSex + age_at_baseline + factor(type_and_treatment) + polymicrobial + factor(Charlson_grp) +
+                           factor(diagnosis_year) + other_primary + length_of_stay,
+                     data = dataset, family = binomial())
+  
+  prob.num <- predict(model_num, type = "response")
+  prob.denum <- predict(model_denom, type = "response")
+
+  dataset$weight <- (dataset$AMR==1)*prob.num/prob.denum + (dataset$AMR==0)*(1-prob.num)/(1-prob.denum)
+  
+  dataset1 = dataset[dataset$AMR==0, ]
+  km_counterfactual <- survfit(Surv(studytime, event) ~ 1, data = dataset1, weights = weight)
+  
+  # Extracting survival times and probabilities
+  times <- km_counterfactual$time  
+  stepfu <- km_counterfactual$surv
+  
+  # Returning a data frame of times and survival probabilities
+  output = data.frame(t=times, stepfu=stepfu)
+    
+  return(output)
+}
+
+# Function for bootstrapping step functions
+stepboot <- function(dataset, nboot=50, type="quantile",zerovalue=1, stepf){
+  grid <- seq(1, 31, by = 1) # Set time grid
+  # Estimate on original data:
+  org.fit <- stepf(dataset)
+  org.est <- stepfun(org.fit$t,c(zerovalue,org.fit$stepfu),right=T)
+  # Create matrix for bootstrap results:
+  resmatrix <- matrix(nrow=nboot, ncol=length(grid))
+  # Run on bootstrap resamples:
+  for(i in 1:nboot){
+    #create bootstrap datasets:
+    bootids <- sample(unique(rownames(dataset)),replace=T)
+    freq.table <- table(factor(bootids,levels=unique(rownames(dataset))))
+    bootweights <- as.integer(freq.table[rownames(dataset)])
+    dta.boot <- dataset[rep(row.names(dataset), bootweights),]
+    #Run analysis on boostrap data:
+    fit.boot <- stepf(dta.boot)
+    stepf.boot <- stepfun(fit.boot$t,c(zerovalue,fit.boot$stepfu),right=T)
+    resmatrix[i,] <- stepf.boot(grid)
+  }
+  # Quantilie intervals:
+  if(type == "quantile"){
+    q <- apply(resmatrix, 2, quantile, probs = c(0.025,0.975),  na.rm = FALSE)
+  }
+  # Return:
+  data.frame(t=grid,org.est=org.est(grid),lower=q[1,],upper=q[2,])
+}
+
+# Run bootstrap
+boots = stepboot(study_data2, nboot=1000, type="quantile", zerovalue=1, stepf=stepf)
+
+# Export for plotting
+write.csv(boots, "figure_3C1.csv", row.names = FALSE)
+
+# Kaplan-Meier survival fit with confidence intervals
+km_fit <- survfit(Surv(studytime, event) ~ 1, data = study_data2)
+
+# Convert survfit object to a dataframe for plotting
+km_data <- tidy(km_fit, conf.int = TRUE) 
+
+# Export for plotting
+write.csv(km_data, "figure_3C2.csv", row.names = FALSE)
+
+```
+
+### Excess mortality estimates
+
+```{r excess mortality}
+
+#Estimate the observed CIF:
+fit.o <- survfit(Surv(studytime, event) ~ 1, data = study_data2)
+# Get the cumulative incidence
+cif.o.adj <- 1 - fit.o$surv[length(fit.o$surv)]
+#Estimate the counterfactual CIF, assuming everyone had no AMR: 
+# Filter the dataset
+no_AMR_data <- study_data2[study_data2$AMR == 0, ]
+# Fit a weighted survival curve
+fit.c.pseudo <- survfit(Surv(studytime, event) ~ 1, data = no_AMR_data, weights = weight)
+# Get the cumulative incidence at the last observed time point
+cif.c.pseudo <- 1 - fit.c.pseudo$surv[length(fit.c.pseudo$surv)]
+excess_mortality <- cif.o.adj - cif.c.pseudo
+
+# Print the results 
+print(excess_mortality)
+
+```
+
+Bootstrapping for CI.
+
+```{r bootstrapping excess mortality}
+
+set.seed(1337) # For reproducibility
+
+# Define the function to calculate the weighted excess mortality for a given dataset
+calculate_excess_mortality <- function(dataset) {
+  # Calculate weights
+  model_num <- glm(AMR ~ 1, data = dataset, family = binomial())
+  model_denom <- glm(AMR ~ LinkedSex + age_at_baseline + factor(type_and_treatment) + polymicrobial + factor(Charlson_grp) +
+                     factor(diagnosis_year) + other_primary + length_of_stay,
+                     data = dataset, family = binomial())
+
+  prob.num <- predict(model_num, type = "response")
+  prob.denum <- predict(model_denom, type = "response")
+
+  dataset$weight <- ifelse(dataset$AMR == 1, prob.num / prob.denum, (1 - prob.num) / (1 - prob.denum))
+
+  # Estimate the observed CIF with all data
+  fit.o <- survfit(Surv(studytime, event) ~ 1, data = dataset)
+  cif.o.adj <- 1 - fit.o$surv[length(fit.o$surv)]
+
+  # Estimate the counterfactual CIF, assuming everyone had no AMR
+  no_AMR_data <- dataset[dataset$AMR == 0, ]
+  fit.c.pseudo <- survfit(Surv(studytime, event) ~ 1, data = no_AMR_data, weights = no_AMR_data$weight)
+  cif.c.pseudo <- 1 - fit.c.pseudo$surv[length(fit.c.pseudo$surv)]
+
+  # Calculate and return excess mortality
+  excess_mortality <- cif.o.adj - cif.c.pseudo
+  return(excess_mortality)
+}
+
+# Bootstrap procedure
+nboot <- 1000
+excess_mortality.boot <- numeric(nboot)
+
+for (i in 1:nboot) {
+  # Create a bootstrap dataset
+  bootids <- sample(nrow(study_data2), replace = TRUE)
+  boot_data <- study_data2[bootids, ]
+  
+  # Calculate excess mortality for the bootstrap sample
+  excess_mortality.boot[i] <- calculate_excess_mortality(boot_data)
+}
+
+# Calculate the 95% Confidence Interval for excess mortality
+excess_mortality_CI <- quantile(excess_mortality.boot, c(0.025, 0.975))
+print(excess_mortality_CI)
+
+```
+
+Dataframe for figure 4.
+
+```{r excess mortality plot}
+
+# Bootstrapped Excess Mortality Estimates
+bootstrapped_excess_mortality <- excess_mortality.boot 
+
+# Point Estimate and Confidence Intervals for Excess Mortality
+point_estimate_excess_mortality <- excess_mortality 
+lower_ci_excess_mortality <- excess_mortality_CI[1] 
+upper_ci_excess_mortality <- excess_mortality_CI[2] 
+
+# Create a dataframe for plotting
+excess_mortality_data <- data.frame(bootstrapped_excess_mortality)
+
+```
+
+### PAF
+
+First point estimate for in-text referencing. 
+
+```{r PAF}
+
+# Calculate the PAF
+PAF <- (cif.o.adj - cif.c.pseudo) / cif.o.adj
+
+# Print the results
+cat("PAF due to AMR at the end of follow-up:", PAF, "\n")
+
+```
+
+Bootstrapping for CI.
+
+```{r bootstrapping PAF}
+
+set.seed(1337) # For reproducibility
+
+# Define the function to calculate the weighted excess mortality for a given dataset
+calculate_PAF <- function(dataset) {
+  
+  # Calculate weights
+  model_num <- glm(AMR ~ 1, data = dataset, family = binomial())
+  model_denom <- glm(AMR ~ LinkedSex + age_at_baseline + factor(type_and_treatment) + polymicrobial + factor(Charlson_grp) +
+                     factor(diagnosis_year) + other_primary + length_of_stay,
+                     data = dataset, family = binomial())
+
+  prob.num <- predict(model_num, type = "response")
+  prob.denum <- predict(model_denom, type = "response")
+
+  dataset$weight <- ifelse(dataset$AMR == 1, prob.num / prob.denum, (1 - prob.num) / (1 - prob.denum))
+
+  # Estimate the observed CIF with all data
+  fit.o <- survfit(Surv(studytime, event) ~ 1, data = dataset)
+  cif.o.adj <- 1 - fit.o$surv[length(fit.o$surv)]
+
+  # Estimate the counterfactual CIF, assuming everyone had no AMR
+  no_AMR_data <- dataset[dataset$AMR == 0, ]
+  fit.c.pseudo <- survfit(Surv(studytime, event) ~ 1, data = no_AMR_data, weights = no_AMR_data$weight)
+  cif.c.pseudo <- 1 - fit.c.pseudo$surv[length(fit.c.pseudo$surv)]
+
+  # Calculate and return excess mortality
+  PAF <- (cif.o.adj - cif.c.pseudo) / cif.o.adj 
+  return(PAF)
+}
+
+# Bootstrap procedure
+nboot <- 1000
+PAF.boot <- numeric(nboot)
+
+for (i in 1:nboot) {
+  # Create a bootstrap dataset
+  bootids <- sample(nrow(study_data2), replace = TRUE)
+  boot_data <- study_data2[bootids, ]
+  
+  # Calculate excess mortality for the bootstrap sample
+  PAF.boot[i] <- calculate_PAF(boot_data)
+}
+
+# Calculate the 95% Confidence Interval for excess mortality
+PAF_CI <- quantile(PAF.boot, c(0.025, 0.975))
+print(PAF_CI)
+
+# Bootstrapped PAF estimates
+bootstrapped_PAF <- PAF.boot 
+
+# Point estimate and confidence intervals
+point_estimate <- PAF
+lower_ci <- PAF_CI[1]
+upper_ci <- PAF_CI[2]
+
+# Create a dataframe to plot
+paf_data <- data.frame(bootstrapped_PAF)
+
+
+```
+
+### E-value
+
+```{r e-value}
+
+# E-value of the excess mortality estimate
+
+# Convert risk difference to risk ratio
+baseline_risk <- cif.c.pseudo
+rr <- (baseline_risk + excess_mortality) / baseline_risk
+
+rr_lower <- (baseline_risk + excess_mortality_CI[1]) / baseline_risk
+rr_upper <- (baseline_risk + excess_mortality_CI[2]) / baseline_risk
+
+# Calculate the E-value 
+e_val <- evalue(RR(rr), lo = rr_lower, hi = rr_upper)
+
+print(e_val)
+
+```
+
+### Figure 4
+
+```{r density plots}
+
+excess_mortality_density_plot <- ggplot(excess_mortality_data, aes(x = bootstrapped_excess_mortality)) +
+  geom_density(fill = "#440154", alpha = 0.7) +  # Adjust alpha here
+  geom_vline(xintercept = point_estimate_excess_mortality, color = "#440154", linetype = "dashed", linewidth = 1) +  # Adjust alpha
+  geom_vline(xintercept = lower_ci_excess_mortality, color = "#440154", linetype = "dashed", linewidth = 1, alpha = 0.7) +  # Adjust alpha
+  geom_vline(xintercept = upper_ci_excess_mortality, color = "#440154", linetype = "dashed", linewidth = 1, alpha = 0.7) +  # Adjust alpha
+  scale_x_continuous(limits = c(0.0, 0.035), breaks = seq(0.0, 0.035, by = 0.005)) +
+  labs(title = "A", x = "Excess mortality", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none", plot.caption = element_blank())
+
+PAF_density_plot <- ggplot(paf_data, aes(x = bootstrapped_PAF)) +
+  geom_density(fill = "#440154", alpha = 0.7) +  # Adjust alpha here
+  geom_vline(xintercept = point_estimate, color = "#440154", linetype = "dashed", linewidth = 1) +  # Adjust alpha
+  geom_vline(xintercept = lower_ci, color = "#440154", linetype = "dashed", linewidth = 1, alpha = 0.7) +  # Adjust alpha
+  geom_vline(xintercept = upper_ci, color = "#440154", linetype = "dashed", linewidth = 1, alpha = 0.7) +  # Adjust alpha
+  scale_x_continuous(limits = c(0.0, 0.125), breaks = seq(0.0, 0.125, by = 0.02)) +
+  labs(title = "B", x = "Population-attributable fraction", y = "Density") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none", plot.caption = element_blank())
+
+# Combine the plots vertically 
+combined_plot <- excess_mortality_density_plot / PAF_density_plot
+
+# Save the combined plot as a PNG file
+ggsave("figure_4.png", plot = combined_plot, device = "png", width = 7, height = 12, units = "in")
+
+```
+
+### Supplementary Material S4
+
+```{r Supplementary Material S4}
+
+# Filter the dataset for pathogen cases only
+TGCREC_data <- subset(study_data2, (TGCREC == 1 | TGCSEC == 1))
+MRSA_data <- subset(study_data2, (MRSA == 1 | MSSA == 1))
+CRPA_data <- subset(study_data2, (CRPA == 1 | CSPA == 1))
+TGCRKP_data <- subset(study_data2, (TGCRKP == 1 | TGCSKP == 1))
+CRA_data <- subset(study_data2, (CRA == 1 | CSA == 1))
+CRKP_data <- subset(study_data2, (CRKP == 1 | CSKP == 1))
+vre_data <- subset(study_data2, (VRE == 1 | VSE == 1))
+CREC_data <- subset(study_data2, (CREC == 1 | CSEC == 1)) 
+
+set.seed(1337) # Ensure reproducibility
+
+# Function to calculate excess mortality for a given dataset already exists 
+
+# Generalized bootstrap function
+bootstrap_excess_mortality <- function(data, nboot = 1000) {
+  boot_excess_mortality <- numeric(nboot)
+  
+  for (i in 1:nboot) {
+    boot_data <- data[sample(nrow(data), replace = TRUE), ]
+    boot_excess_mortality[i] <- calculate_excess_mortality(boot_data)
+  }
+  
+  CI <- quantile(boot_excess_mortality, c(0.025, 0.975))
+  list(mean = mean(boot_excess_mortality), CI_lower = CI[1], CI_upper = CI[2])
+}
+
+# Apply bootstrapping to each drug-pathogen combination
+pathogen_combinations <- list(TGCREC = TGCREC_data, MRSA = MRSA_data, CRPA = CRPA_data, TGCRKP = TGCRKP_data,
+                              CRA = CRA_data, CRKP = CRKP_data, VRE = vre_data, CREC = CREC_data)
+
+results <- lapply(names(pathogen_combinations), function(pathogen) {
+  data <- pathogen_combinations[[pathogen]]
+  bootstrap_results <- bootstrap_excess_mortality(data)
+  c(Pathogen = pathogen, Excess_Mortality = bootstrap_results$mean, 
+    CI_Lower = bootstrap_results$CI_lower, CI_Upper = bootstrap_results$CI_upper)
+})
+
+# Convert the results to a data frame
+results_df <- do.call(rbind, results)
+row.names(results_df) <- NULL
+
+# Print the final table
+print(results_df)
+
+
+```
+
+### Sensitivity analysis
+
+```{r sensitivity analysis}
+
+# Weighting
+
+# Stabilised
+
+model_num <- glm(AMR ~ 1, 
+                 data = study_data2, family = binomial)
+model_denom <- glm(AMR ~ LinkedSex + age_at_baseline + factor(type_and_treatment) + polymicrobial + factor(Charlson_grp) +
+                     factor(diagnosis_year) + other_primary + length_of_stay + previous_antibiotics_days,
+                 data = study_data2, family = binomial)
+
+prob.num <- predict(model_num, study_data2, type="response")
+prob.denum <- predict(model_denom, study_data2, type="response")
+
+study_data2$weight <- (study_data2$AMR==1)*prob.num/prob.denum + (study_data2$AMR==0)*(1-prob.num)/(1-prob.denum)
+
+print(summary(study_data2$weight))
+
+#Estimate the observed CIF:
+fit.o <- survfit(Surv(studytime, event) ~ 1, data = study_data2)
+# Get the cumulative incidence
+cif.o.adj <- 1 - fit.o$surv[length(fit.o$surv)]
+#Estimate the counterfactual CIF, assuming everyone had no AMR: 
+# Filter the dataset
+no_AMR_data <- study_data2[study_data2$AMR == 0, ]
+# Fit a weighted survival curve
+fit.c.pseudo <- survfit(Surv(studytime, event) ~ 1, data = no_AMR_data, weights = weight)
+# Get the cumulative incidence at the last observed time point
+cif.c.pseudo <- 1 - fit.c.pseudo$surv[length(fit.c.pseudo$surv)]
+excess_mortality <- cif.o.adj - cif.c.pseudo
+
+# Print the results 
+print(excess_mortality)
+
+set.seed(1337) # For reproducibility
+
+# Define the function to calculate the weighted excess mortality for a given dataset
+calculate_excess_mortality <- function(dataset) {
+  # Calculate weights
+  model_num <- glm(AMR ~ 1, data = dataset, family = binomial())
+  model_denom <- glm(AMR ~ LinkedSex + age_at_baseline + factor(type_and_treatment) + polymicrobial + factor(Charlson_grp) +
+                     factor(diagnosis_year) + other_primary + length_of_stay + previous_antibiotics_days,
+                     data = dataset, family = binomial())
+
+  prob.num <- predict(model_num, type = "response")
+  prob.denum <- predict(model_denom, type = "response")
+
+  dataset$weight <- ifelse(dataset$AMR == 1, prob.num / prob.denum, (1 - prob.num) / (1 - prob.denum))
+
+  # Estimate the observed CIF with all data
+  fit.o <- survfit(Surv(studytime, event) ~ 1, data = dataset)
+  cif.o.adj <- 1 - fit.o$surv[length(fit.o$surv)]
+
+  # Estimate the counterfactual CIF, assuming everyone had no AMR
+  no_AMR_data <- dataset[dataset$AMR == 0, ]
+  fit.c.pseudo <- survfit(Surv(studytime, event) ~ 1, data = no_AMR_data, weights = no_AMR_data$weight)
+  cif.c.pseudo <- 1 - fit.c.pseudo$surv[length(fit.c.pseudo$surv)]
+
+  # Calculate and return excess mortality
+  excess_mortality <- cif.o.adj - cif.c.pseudo
+  return(excess_mortality)
+}
+
+# Bootstrap procedure
+nboot <- 1000
+excess_mortality.boot <- numeric(nboot)
+
+for (i in 1:nboot) {
+  # Create a bootstrap dataset
+  bootids <- sample(nrow(study_data2), replace = TRUE)
+  boot_data <- study_data2[bootids, ]
+  
+  # Calculate excess mortality for the bootstrap sample
+  excess_mortality.boot[i] <- calculate_excess_mortality(boot_data)
+}
+
+# Calculate the 95% Confidence Interval for excess mortality
+excess_mortality_CI <- quantile(excess_mortality.boot, c(0.025, 0.975))
+print(excess_mortality_CI)
+
+```
+
+### Table S4
+
+```{r table of the weighted population}
+
+# Calculate both unweighted and weighted statistics
+stats_df <- study_data2 %>%
+  mutate(LinkedSex_numeric = as.numeric(LinkedSex == "M")) %>%
+  group_by(AMR) %>%
+  summarize(
+    # Unweighted means for continuous and dichotomous variables
+    age_unweighted_mean = mean(age_at_baseline, na.rm = TRUE),
+    sex_unweighted_proportion = mean(LinkedSex_numeric, na.rm = TRUE), 
+    other_primary_unweighted_proportion = mean(other_primary, na.rm = TRUE),
+    polymicrobial_unweighted_proportion = mean(polymicrobial, na.rm = TRUE),
+    LOS_unweighted_mean = mean(length_of_stay, na.rm = TRUE),
+    
+    # Weighted means for continuous and dichotomous variables
+    age_weighted_mean = sum(age_at_baseline * weight) / sum(weight, na.rm = TRUE),
+    sex_weighted_proportion = sum(LinkedSex_numeric * weight) / sum(weight, na.rm = TRUE),
+    other_primary_weighted_proportion = sum(other_primary * weight) / sum(weight, na.rm = TRUE),
+    polymicrobial_weighted_proportion = sum(polymicrobial * weight) / sum(weight, na.rm = TRUE),
+    LOS_weighted_mean = sum(length_of_stay * weight) / sum(weight, na.rm = TRUE),
+    .groups = 'drop'
+    
+  ) %>%
+  pivot_longer(
+    -AMR,
+    names_to = "Statistic",
+    values_to = "Value"
+  )
+
+# Pivot data to have AMR groups as columns and include both unweighted and weighted statistics
+stats_wide_df <- stats_df %>%
+  pivot_wider(
+    names_from = AMR,
+    values_from = Value,
+    names_prefix = "AMR_"
+  )
+
+# Print the wide-format dataframe
+print(stats_wide_df)
+
+```
+
+# Conference 
+
+```{r ECCMID 2024, eval=F}
+
+# Oxford Data
+oxford_tbl <- study_data2 %>% 
+  select(AMR, age_at_baseline, LinkedSex, diagnose_4, Charlson) %>% 
+  tbl_summary(
+    by = AMR, 
+    label = list(
+      age_at_baseline ~ "Age",
+      LinkedSex ~ "Sex",
+      diagnose_4 ~ "Cancer type",
+      Charlson ~ "Charlson Comorbidity Index"
+    )
+  ) %>% 
+  add_overall() %>% 
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Oxford**") %>% 
+  bold_labels()
+
+# Export Oxford tbl_summary
+saveRDS(oxford_tbl, "oxford_tbl_summary.rds")
+
+# Plots with colour scheme for the poster
+
+# Plotting the density plot
+PAF_density_plot <- ggplot(paf_data, aes(x = bootstrapped_PAF)) +
+  geom_density(fill = "#92c5de", alpha = 0.8) + 
+  geom_vline(xintercept = point_estimate, color = "#0571b0", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = lower_ci, color = "#92c5de", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = upper_ci, color = "#92c5de", linetype = "dashed", linewidth = 1) +
+  scale_x_continuous(limits = c(0.0, 0.5), breaks = seq(0.0, 0.5, by = 0.10)) +
+  labs(
+    title = "Density plot of bootstrapped population-attributable fraction estimates",
+    x = "Population-attributable fraction",
+    y = "Density",
+    caption = "Dashed lines: Middle - Point estimate; Outer - Confidence interval limits"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+
+# Save the plot to a PDF file
+pdf_file_path_2 <- "PAF_density_plot.pdf"
+ggsave(pdf_file_path_2, plot = PAF_density_plot, device = "pdf", width = 7, height = 5)
+
+PAF_density_plot
+
+# Plotting the density plot for Excess Mortality
+excess_mortality_density_plot <- ggplot(excess_mortality_data, aes(x = bootstrapped_excess_mortality)) +
+  geom_density(fill = "#92c5de", alpha = 0.8) + 
+  geom_vline(xintercept = point_estimate_excess_mortality, color = "#0571b0", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = lower_ci_excess_mortality, color = "#92c5de", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = upper_ci_excess_mortality, color = "#92c5de", linetype = "dashed", linewidth = 1) +
+  scale_x_continuous(limits = c(0.0, 0.30), breaks = seq(0.0, 0.25, by = 0.05)) +
+  labs(
+    title = "Density plot of bootstrapped excess mortality estimates",
+    x = "Excess mortality",
+    y = "Density",
+    caption = "Dashed lines: Middle - Point estimate; Outer - Confidence interval limits"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+
+# Save the plot to a PDF file
+pdf_file_path <- "excess_mortality_density_plot.pdf"
+ggsave(pdf_file_path, plot = excess_mortality_density_plot, device = "pdf", width = 7, height = 5)
+
+excess_mortality_density_plot
+
+```
+
+
+
